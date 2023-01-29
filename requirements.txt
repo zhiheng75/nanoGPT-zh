@@ -1,0 +1,9 @@
+#pytorch
+torch
+torchvision
+numpy
+transformers
+datasets
+tiktoken
+wandb
+tqdm
