@@ -45,7 +45,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -70,7 +70,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' # 'float32' or 'bfloat16'
+dtype = 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -98,8 +98,8 @@ torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-# note: float16 would require us to change the code to use a GradScaler
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
+# note: float16 data type will automatically use a GradScaler
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader, TODO evaluate need for actual DataLoader
@@ -111,7 +111,8 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    x, y = x.to(device), y.to(device)
+    # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+    x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -173,6 +174,9 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
 model.to(device)
 
+# initialize a GradScaler. If enabled=False scaler is a no-op
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2))
 if init_from == 'resume':
@@ -188,6 +192,7 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+# helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -204,15 +209,15 @@ def estimate_loss():
     return out
 
 # learning rate decay scheduler (cosine with warmup)
-def get_lr(iter):
+def get_lr(it):
     # 1) linear warmup for warmup_iters steps
-    if iter < warmup_iters:
-        return learning_rate * iter / warmup_iters
-    # 2) if iter > lr_decay_iters, return min learning rate
-    if iter > lr_decay_iters:
+    if it < warmup_iters:
+        return learning_rate * it / warmup_iters
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > lr_decay_iters:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (iter - warmup_iters) / (lr_decay_iters - warmup_iters)
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
@@ -223,6 +228,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
+X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 while True:
 
@@ -263,8 +269,8 @@ while True:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        X, Y = get_batch('train')
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
@@ -273,10 +279,18 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
-        loss.backward()
-    if grad_clip != 0:
+        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        X, Y = get_batch('train')
+        # backward pass, with gradient scaling if training in fp16
+        scaler.scale(loss).backward()
+    # clip the gradient
+    if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    optimizer.step()
+    # step the optimizer and scaler if training in fp16
+    scaler.step(optimizer)
+    scaler.update()
+    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging

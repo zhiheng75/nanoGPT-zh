@@ -9,13 +9,15 @@ import torch
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
-batch_size = 8
+batch_size = 12
 block_size = 1024
-bias = True
+bias = False
+real_data = True
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' # 'float32' or 'bfloat16' or 'float16'
 compile = True # use PyTorch 2.0 to compile the model to be faster
+profile = False # use pytorch profiler, or just simple benchmarking?
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
@@ -28,7 +30,6 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # data loading init
-real_data = True
 if real_data:
     dataset = 'openwebtext'
     data_dir = os.path.join('data', dataset)
@@ -38,7 +39,7 @@ if real_data:
         ix = torch.randint(len(data) - block_size, (batch_size,))
         x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-        x, y = x.to(device), y.to(device)
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         return x, y
 else:
     # alternatively, if fixed data is desired to not care about data loading
@@ -62,7 +63,6 @@ if compile:
     print("Compiling model...")
     model = torch.compile(model) # pytorch 2.0
 
-profile = False # use pytorch profiler, or just simple benchmarking?
 if profile:
     # useful docs on pytorch profiler:
     # - tutorial https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
@@ -73,17 +73,18 @@ if profile:
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler('./bench_log'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True, # incurs an additional overhead, disable if not needed
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False, # incurs an additional overhead, disable if not needed
         with_flops=True,
         with_modules=False, # only for torchscript models atm
     ) as prof:
 
+        X, Y = get_batch('train')
         for k in range(num_steps):
-            X, Y = get_batch('train')
             with ctx:
                 logits, loss = model(X, Y)
+            X, Y = get_batch('train')
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -98,10 +99,11 @@ else:
     torch.cuda.synchronize()
     for stage, num_steps in enumerate([10, 20]): # burnin, then benchmark
         t0 = time.time()
+        X, Y = get_batch('train')
         for k in range(num_steps):
-            X, Y = get_batch('train')
             with ctx:
                 logits, loss = model(X, Y)
+            X, Y = get_batch('train')
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
